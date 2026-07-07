@@ -70,7 +70,13 @@ def expand_sense_key(raw_key: str) -> list[str]:
 
 
 def build_correction_map(csv_path: str) -> dict:
-    corrections = defaultdict(dict)
+    # A (old_key, context) pair can legitimately appear more than once: the
+    # same sentence can contain two occurrences of the same old sense key
+    # that need different replacements (e.g. "asked" tagged ask%2:32:00::
+    # twice in one sentence, meaning two different senses). Rows are stored
+    # in CSV order and handed out one-per-occurrence, in that order, as
+    # matching occurrences are found in the corpus.
+    corrections = defaultdict(lambda: defaultdict(list))
     with open(csv_path) as f:
         for row in csv.reader(f):
             old_key = row[0]
@@ -87,14 +93,7 @@ def build_correction_map(csv_path: str) -> dict:
                 if "%" in new_key and ":" not in new_key.split("%", 1)[1]:
                     lemma, rest = new_key.split("%", 1)
                     new_key = lemma + "%" + rest.replace(".", ":")
-                if (
-                    context in corrections[old_key]
-                    and new_key != corrections[old_key][context]
-                ):
-                    print(
-                        f"Warning duplicate but different keys: {new_key} vs {corrections[old_key][context]}"
-                    )
-                corrections[old_key][context] = new_key
+                corrections[old_key][context].append(new_key)
     return corrections
 
 
@@ -228,21 +227,115 @@ def apply_mwe_splits(corpus: teanga.Corpus, csv_path: str) -> teanga.Corpus:
     return corpus
 
 
-def add_oewn2026_keys(corpus: teanga.Corpus, csv_path: str) -> teanga.Corpus:
+def resolve_fix_key(value: str) -> str:
+    # "-" / "new sense" mark a word that gets no key; "occur" is shorthand
+    # (also used in semcor_updated_sense_keys.csv) for the "happen" sense of "be".
+    value = value.strip()
+    if value in ("-", "new sense"):
+        return "-"
+    if value == "occur":
+        return "be%2:30:14::"
+    return fix_dotted_key(value)
+
+
+def apply_indexed_fixes(corpus: teanga.Corpus, csv_path: str) -> teanga.Corpus:
+    """
+    Apply sense-key fixes located by exact (doc_id, annotation_index) instead
+    of the fuzzy context matching apply_mwe_splits/add_oewn2026_keys use.
+    annotation_index is a token index in the corpus as it stands *after*
+    apply_mwe_splits has run, so this must be called afterwards. Rows with a
+    single fix column correct (or add) the key on that one token; rows with
+    more than one split the token the same way apply_mwe_splits does.
+    """
+    with open(csv_path) as f:
+        rows = list(csv.reader(f))[1:]  # skip header
+
+    docs_by_id = {doc_id: doc for doc_id, doc in zip(corpus.doc_ids, corpus.docs)}
+
+    actions_by_doc = defaultdict(list)
+    skipped = 0
+    for row in rows:
+        if len(row) < 4 or not row[2] or not row[3]:
+            continue
+        doc_id, idx = row[2], int(row[3])
+        if doc_id not in docs_by_id:
+            skipped += 1
+            continue
+        cols = row[4:6]
+        last = max((i for i, v in enumerate(cols) if v.strip()), default=-1)
+        if last == -1:
+            continue
+        num_words = last + 1
+        sub_keys = [resolve_fix_key(v) for v in cols[:num_words]]
+        actions_by_doc[doc_id].append((idx, num_words, sub_keys))
+
+    split_count = 0
+    substituted_count = 0
+    for doc_id, actions in actions_by_doc.items():
+        doc = docs_by_id[doc_id]
+        # Highest token index first so earlier splits in the same doc aren't
+        # thrown off by index shifts caused by later ones.
+        for idx, num_words, sub_keys in sorted(actions, key=lambda a: -a[0]):
+            tokens = list(doc.tokens)
+            txt = str(doc.text)
+            tok_text = txt[tokens[idx][0] : tokens[idx][1]]
+
+            parts = None
+            if num_words > 1:
+                for sep in ("_", "-"):
+                    if tok_text.count(sep) == num_words - 1:
+                        parts = tok_text.split(sep)
+                        break
+
+            if parts is not None and len(parts) == num_words:
+                split_token(idx, parts, sub_keys, doc)
+                split_count += 1
+            else:
+                if sub_keys[0] != "-":
+                    keys = dict(doc.wn30_key)
+                    keys[idx] = sub_keys[0]
+                    doc.wn30_key = sorted(keys.items())
+                substituted_count += 1
+
+    print(
+        f"Applied indexed fixes: split {split_count} tokens and corrected "
+        f"{substituted_count} single-token annotations out of {len(rows)} "
+        f"entries in {csv_path} ({skipped} skipped, doc not found)"
+    )
+
+    return corpus
+
+
+def load_new_key_ssids(csv_path: str) -> dict:
+    # Sense keys introduced in OEWN 2026 that don't exist in oewn:2025+, so
+    # build_ssid_index can't find them. Format: sense_key,synset_id
+    new_keys = {}
+    with open(csv_path) as f:
+        for row in csv.reader(f):
+            if row and row[0]:
+                new_keys[row[0]] = row[1]
+    return new_keys
+
+
+def add_oewn2026_keys(
+    corpus: teanga.Corpus, csv_path: str, new_keys_csv_path: str
+) -> teanga.Corpus:
     wordnet = wn.Wordnet("oewn:2025+")
     ssid_index = build_ssid_index(wordnet)
+    ssid_index.update(load_new_key_ssids(new_keys_csv_path))
     corrections = build_correction_map(csv_path)
     corrections_set = set(
         (key, context) for key, contexts in corrections.items() for context in contexts
     )
 
-    # Precompute stripped versions of every context string (keyed by sense key)
-    stripped_corrections: dict[str, dict[str, tuple[str, str]]] = defaultdict(dict)
+    # Precompute stripped versions of every context string (keyed by sense key).
+    # Each context maps to a *list* of replacements, one per occurrence of the
+    # sense key within that sentence, consumed in order (see build_correction_map).
+    stripped_corrections: dict[str, dict[str, tuple[str, list[str]]]] = defaultdict(dict)
     for key, ctx_map in corrections.items():
-        for ctx, repl in ctx_map.items():
-            if repl == "occur":
-                repl = "be%2:30:14::"
-            stripped_corrections[key][strip_for_match(ctx)] = (ctx, repl)
+        for ctx, repls in ctx_map.items():
+            resolved = ["be%2:30:14::" if r == "occur" else r for r in repls]
+            stripped_corrections[key][strip_for_match(ctx)] = (ctx, resolved)
 
     corpus.add_layer_meta(
         "oewn2026_key", layer_type="element", base="tokens", data="string"
@@ -285,15 +378,22 @@ def add_oewn2026_keys(corpus: teanga.Corpus, csv_path: str) -> teanga.Corpus:
                 # a short/generic context (e.g. "I asked .") can't hijack a
                 # match ahead of a more specific, correct context for the
                 # same sense key.
-                match = candidates.get(stripped_sent)
+                exact = candidates.get(stripped_sent)
+                match = exact if exact is not None and exact[1] else None
                 if match is None:
                     best_len = -1
                     for stripped_ctx, candidate in candidates.items():
+                        if not candidate[1]:
+                            continue
                         if stripped_ctx in stripped_sent and len(stripped_ctx) > best_len:
                             match = candidate
                             best_len = len(stripped_ctx)
                 if match is not None:
-                    orig_ctx, repl = match
+                    orig_ctx, repls = match
+                    # Consume one replacement per occurrence, in CSV row
+                    # order, so repeated occurrences of the same sense key
+                    # within one sentence get their own distinct replacement.
+                    repl = repls.pop(0)
                     oewn2026.append([idx, repl])
                     corrections_made.add((lookup_key, orig_ctx))
                     replaced = True
@@ -310,12 +410,15 @@ def add_oewn2026_keys(corpus: teanga.Corpus, csv_path: str) -> teanga.Corpus:
 
         ssid = []
         for idx, raw_key in oewn2026:
+            resolved_ssids = []
             for key in raw_key.split(";"):
                 if key in ssid_index:
-                    ssid.append([idx, ssid_index.get(key, None)])
+                    resolved_ssids.append(ssid_index[key])
                 else:
                     print(f"Warning: sense key {key} not found in WordNet 2026 index")
-        doc.oewn2026_key = oewn2026
+            if resolved_ssids:
+                ssid.append([idx, ";".join(resolved_ssids)])
+        doc.oewn2026_key = ssid
 
     print(f"Made {len(corrections_made)} out of {len(corrections_set)} corrections")
     print(list(corrections_set.difference(corrections_made))[:5])
@@ -329,16 +432,18 @@ def main():
 
     corpus = apply_mwe_splits(corpus, "data/mwe2single.csv")
 
-    corpus = add_oewn2026_keys(corpus, "data/semcor_updated_sense_keys.csv")
+    corpus = apply_indexed_fixes(corpus, "data/missing_sense_keys.csv")
 
+    corpus = add_oewn2026_keys(
+        corpus, "data/semcor_updated_sense_keys.csv", "data/2026_new_keys.csv"
+    )
+
+    # oewn2026_key is sparse (unresolvable keys get no entry), so compare by
+    # token index rather than assuming the two layers line up positionally.
     total = sum(len(list(doc["wn30_key"])) for doc in corpus.docs)
-    updated = 0
-    for doc in corpus.docs:
-        for (_, old_key), (_, new_key) in zip(doc["wn30_key"], doc["oewn2026_key"]):
-            if old_key != new_key:
-                updated += 1
+    resolved = sum(len(list(doc["oewn2026_key"])) for doc in corpus.docs)
 
-    print(f"Updated {updated}/{total} sense key annotations")
+    print(f"Resolved {resolved}/{total} sense key annotations to OEWN 2026 synsets")
     corpus.to_yaml("data/semcor_oewn2026.yaml")
     print("Written to data/semcor_oewn2026.yaml")
 
