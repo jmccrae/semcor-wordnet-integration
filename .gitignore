@@ -11,3 +11,4 @@ wheels/
 
 # Generated output (reproducible via `uv run python main.py`)
 data/semcor_oewn2026.yaml
+data/by_category
